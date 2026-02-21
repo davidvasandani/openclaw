@@ -1,9 +1,15 @@
+import { createJiti } from "jiti";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createJiti } from "jiti";
 import type { OpenClawConfig } from "../config/config.js";
 import type { GatewayRequestHandler } from "../gateway/server-methods/types.js";
+import type {
+  OpenClawPluginDefinition,
+  OpenClawPluginModule,
+  PluginDiagnostic,
+  PluginLogger,
+} from "./types.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { isPathInsideWithRealpath } from "../security/scan-paths.js";
 import { resolveUserPath } from "../utils.js";
@@ -23,12 +29,6 @@ import { createPluginRegistry, type PluginRecord, type PluginRegistry } from "./
 import { setActivePluginRegistry } from "./runtime.js";
 import { createPluginRuntime } from "./runtime/index.js";
 import { validateJsonSchemaValue } from "./schema-validator.js";
-import type {
-  OpenClawPluginDefinition,
-  OpenClawPluginModule,
-  PluginDiagnostic,
-  PluginLogger,
-} from "./types.js";
 
 export type PluginLoadResult = PluginRegistry;
 
@@ -84,6 +84,32 @@ const resolvePluginSdkAlias = (): string | null =>
 
 const resolvePluginSdkAccountIdAlias = (): string | null => {
   return resolvePluginSdkAliasFile({ srcFile: "account-id.ts", distFile: "account-id.js" });
+};
+
+/**
+ * Resolves the best available extension entry point, preferring .js in production.
+ * This supports pre-compiled extensions while maintaining backward compatibility with .ts source.
+ */
+const resolveExtensionEntryPoint = (source: string): string => {
+  // If the source path doesn't exist, return as-is (jiti will handle the error)
+  if (!fs.existsSync(source)) {
+    return source;
+  }
+
+  // If source is .ts, check if a .js version exists
+  if (source.endsWith(".ts")) {
+    const jsVersion = source.replace(/\.ts$/, ".js");
+    if (fs.existsSync(jsVersion)) {
+      // Prefer .js in production (when running from dist/)
+      const modulePath = fileURLToPath(import.meta.url);
+      const isDistRuntime = modulePath.split(path.sep).includes("dist");
+      if (isDistRuntime) {
+        return jsVersion;
+      }
+    }
+  }
+
+  return source;
 };
 
 function buildCacheKey(params: {
@@ -506,7 +532,8 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
 
     let mod: OpenClawPluginModule | null = null;
     try {
-      mod = getJiti()(candidate.source) as OpenClawPluginModule;
+      const resolvedSource = resolveExtensionEntryPoint(candidate.source);
+      mod = getJiti()(resolvedSource) as OpenClawPluginModule;
     } catch (err) {
       logger.error(`[plugins] ${record.id} failed to load from ${record.source}: ${String(err)}`);
       record.status = "error";

@@ -1,0 +1,119 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create a GitHub release'
+        required: true
+        default: 'true'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Get commit hash
+        id: commit
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Create distributable tarball
+        run: |
+          tar -czf openclaw-fork-${{ steps.commit.outputs.short_sha }}.tar.gz \
+            dist/ \
+            package.json \
+            openclaw.mjs \
+            extensions/ \
+            assets/ \
+            skills/ \
+            patches/ \
+            scripts/postinstall.js \
+            scripts/format-staged.js \
+            scripts/setup-git-hooks.js \
+            git-hooks/ \
+            README.md \
+            README-header.png \
+            CHANGELOG.md \
+            LICENSE
+
+      - name: Get version from package.json
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name == 'main' && format('v{0}', steps.version.outputs.version) || github.ref_name }}
+          name: ${{ github.ref_name == 'main' && format('Release v{0}', steps.version.outputs.version) || github.ref_name }}
+          draft: false
+          prerelease: false
+          files: openclaw-fork-${{ steps.commit.outputs.short_sha }}.tar.gz
+          body: |
+            ## OpenClaw Fork Build
+
+            **Commit:** ${{ github.sha }}
+            **Short SHA:** ${{ steps.commit.outputs.short_sha }}
+            **Version:** ${{ steps.version.outputs.version }}
+
+            ### Installation
+
+            Download and extract the tarball:
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/openclaw-fork-${{ steps.commit.outputs.short_sha }}.tar.gz
+            tar -xzf openclaw-fork-${{ steps.commit.outputs.short_sha }}.tar.gz
+            cd openclaw
+            npm install --omit=dev
+            ```
+
+            ### What's Included
+
+            - Pre-built distribution (`dist/`)
+            - All 32 extensions (TypeScript source)
+            - Runtime assets and skills
+            - Post-install scripts and git hooks
+
+            ### Changes
+
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/CHANGELOG.md) for details.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-fork-${{ steps.commit.outputs.short_sha }}
+          path: openclaw-fork-${{ steps.commit.outputs.short_sha }}.tar.gz
+          retention-days: 30
