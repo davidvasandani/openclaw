@@ -72,6 +72,32 @@ const resolvePluginSdkAlias = (): string | null => {
   return null;
 };
 
+/**
+ * Resolves the best available extension entry point, preferring .js in production.
+ * This supports pre-compiled extensions while maintaining backward compatibility with .ts source.
+ */
+const resolveExtensionEntryPoint = (source: string): string => {
+  // If the source path doesn't exist, return as-is (jiti will handle the error)
+  if (!fs.existsSync(source)) {
+    return source;
+  }
+
+  // If source is .ts, check if a .js version exists
+  if (source.endsWith(".ts")) {
+    const jsVersion = source.replace(/\.ts$/, ".js");
+    if (fs.existsSync(jsVersion)) {
+      // Prefer .js in production (when running from dist/)
+      const modulePath = fileURLToPath(import.meta.url);
+      const isDistRuntime = modulePath.split(path.sep).includes("dist");
+      if (isDistRuntime) {
+        return jsVersion;
+      }
+    }
+  }
+
+  return source;
+};
+
 function buildCacheKey(params: {
   workspaceDir?: string;
   plugins: NormalizedPluginsConfig;
@@ -292,7 +318,8 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
 
     let mod: OpenClawPluginModule | null = null;
     try {
-      mod = jiti(candidate.source) as OpenClawPluginModule;
+      const resolvedSource = resolveExtensionEntryPoint(candidate.source);
+      mod = jiti(resolvedSource) as OpenClawPluginModule;
     } catch (err) {
       logger.error(`[plugins] ${record.id} failed to load from ${record.source}: ${String(err)}`);
       record.status = "error";
