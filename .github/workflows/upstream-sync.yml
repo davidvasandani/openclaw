@@ -1,0 +1,217 @@
+name: Sync from Upstream
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: 'Force sync even if already up to date'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          repository: davidvasandani/openclaw
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/openclaw/openclaw.git || true
+          git remote set-url upstream https://github.com/openclaw/openclaw.git
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream --tags --force
+          echo "::notice::Fetched latest from upstream openclaw/openclaw"
+
+      - name: Check if sync needed
+        id: check_sync
+        run: |
+          CURRENT_HEAD=$(git rev-parse HEAD)
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+
+          if [ "$CURRENT_HEAD" = "$UPSTREAM_HEAD" ] && [ "${{ inputs.force_sync }}" != "true" ]; then
+            echo "already_synced=true" >> $GITHUB_OUTPUT
+            echo "::notice::Already up to date with upstream"
+          else
+            echo "already_synced=false" >> $GITHUB_OUTPUT
+            echo "::notice::Sync needed: current=$CURRENT_HEAD upstream=$UPSTREAM_HEAD"
+          fi
+
+      - name: Rebase onto upstream
+        if: steps.check_sync.outputs.already_synced != 'true'
+        id: rebase
+        run: |
+          echo "::group::Rebasing main onto upstream/main"
+
+          if git rebase upstream/main; then
+            echo "::notice::Rebase successful"
+            echo "rebase_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "::error::Rebase conflict detected. Manual resolution required."
+            echo "rebase_status=conflict" >> $GITHUB_OUTPUT
+
+            # Get conflict details
+            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ', ' | sed 's/,$//')
+            echo "conflicts=$CONFLICTS" >> $GITHUB_OUTPUT
+
+            # Abort the rebase
+            git rebase --abort
+            exit 1
+          fi
+
+          echo "::endgroup::"
+
+      - name: Push rebased main
+        if: steps.check_sync.outputs.already_synced != 'true' && steps.rebase.outputs.rebase_status == 'success'
+        run: |
+          echo "::group::Pushing rebased main to fork"
+          git push origin main --force-with-lease
+          echo "::notice::Successfully pushed rebased main"
+          echo "::endgroup::"
+
+      - name: Sync upstream tags
+        if: steps.check_sync.outputs.already_synced != 'true' || inputs.force_sync == true
+        id: sync_tags
+        run: |
+          echo "::group::Syncing upstream tags"
+
+          # Get list of new tags from upstream
+          git fetch upstream --tags --force
+
+          # Get tags only in upstream (not in origin)
+          UPSTREAM_TAGS=$(git ls-remote --tags upstream | awk '{print $2}' | sed 's|refs/tags/||' | grep -v '\^{}' || true)
+          FORK_TAGS=$(git ls-remote --tags origin | awk '{print $2}' | sed 's|refs/tags/||' | grep -v '\^{}' || true)
+
+          NEW_TAGS=""
+          for tag in $UPSTREAM_TAGS; do
+            if ! echo "$FORK_TAGS" | grep -q "^${tag}$"; then
+              NEW_TAGS="$NEW_TAGS $tag"
+            fi
+          done
+
+          if [ -z "$NEW_TAGS" ]; then
+            echo "::notice::No new tags to sync"
+            echo "new_tags=" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::New tags detected: $NEW_TAGS"
+            echo "new_tags=$NEW_TAGS" >> $GITHUB_OUTPUT
+
+            # Push new tags to fork (this will trigger release workflow)
+            for tag in $NEW_TAGS; do
+              echo "::notice::Syncing tag: $tag"
+              git push origin refs/tags/$tag:refs/tags/$tag
+            done
+          fi
+
+          echo "::endgroup::"
+
+      - name: Create conflict issue
+        if: failure() && steps.rebase.outputs.rebase_status == 'conflict'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const conflicts = '${{ steps.rebase.outputs.conflicts }}';
+            const issueBody = `## Upstream Sync Conflict Detected
+
+            The automated upstream sync workflow encountered merge conflicts while rebasing \`main\` onto \`openclaw/openclaw:main\`.
+
+            ### Conflicting Files
+
+            \`\`\`
+            ${conflicts}
+            \`\`\`
+
+            ### Resolution Steps
+
+            1. Checkout the main branch locally:
+               \`\`\`bash
+               git checkout main
+               git fetch origin
+               git reset --hard origin/main
+               \`\`\`
+
+            2. Add upstream and rebase:
+               \`\`\`bash
+               git remote add upstream https://github.com/openclaw/openclaw.git
+               git fetch upstream
+               git rebase upstream/main
+               \`\`\`
+
+            3. Resolve conflicts in the files listed above
+
+            4. Continue the rebase:
+               \`\`\`bash
+               git add .
+               git rebase --continue
+               \`\`\`
+
+            5. Force push to fork:
+               \`\`\`bash
+               git push origin main --force-with-lease
+               \`\`\`
+
+            ### Workflow Run
+
+            [View failed workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            ---
+
+            This issue was automatically created by the upstream sync workflow.
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Upstream Sync] Rebase conflicts detected on ${new Date().toISOString().split('T')[0]}`,
+              body: issueBody,
+              labels: ['upstream-sync', 'conflict', 'automation']
+            });
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Upstream Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check_sync.outputs.already_synced }}" = "true" ]; then
+            echo "✅ Already up to date with upstream" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.rebase.outputs.rebase_status }}" = "success" ]; then
+            echo "✅ Successfully rebased and pushed to fork" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.rebase.outputs.rebase_status }}" = "conflict" ]; then
+            echo "❌ Rebase conflicts detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Conflicting files:** ${{ steps.rebase.outputs.conflicts }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -n "${{ steps.sync_tags.outputs.new_tags }}" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### New Tags Synced" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            for tag in ${{ steps.sync_tags.outputs.new_tags }}; do
+              echo "- \`$tag\`" >> $GITHUB_STEP_SUMMARY
+            done
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "These tags will trigger the release workflow." >> $GITHUB_STEP_SUMMARY
+          fi
