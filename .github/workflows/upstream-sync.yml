@@ -50,7 +50,8 @@ jobs:
           CURRENT_HEAD=$(git rev-parse HEAD)
           UPSTREAM_HEAD=$(git rev-parse upstream/main)
 
-          if [ "$CURRENT_HEAD" = "$UPSTREAM_HEAD" ] && [ "${{ inputs.force_sync }}" != "true" ]; then
+          # Check if upstream is already merged
+          if git merge-base --is-ancestor upstream/main HEAD && [ "${{ inputs.force_sync }}" != "true" ]; then
             echo "already_synced=true" >> $GITHUB_OUTPUT
             echo "::notice::Already up to date with upstream"
           else
@@ -58,36 +59,37 @@ jobs:
             echo "::notice::Sync needed: current=$CURRENT_HEAD upstream=$UPSTREAM_HEAD"
           fi
 
-      - name: Rebase onto upstream
+      - name: Merge from upstream
         if: steps.check_sync.outputs.already_synced != 'true'
-        id: rebase
+        id: merge
         run: |
-          echo "::group::Rebasing main onto upstream/main"
+          echo "::group::Merging upstream/main into fork"
 
-          if git rebase upstream/main; then
-            echo "::notice::Rebase successful"
-            echo "rebase_status=success" >> $GITHUB_OUTPUT
+          # Use merge strategy that favors our changes for known conflicts
+          if git merge upstream/main --no-edit -m "Merge upstream openclaw/openclaw $(git rev-parse --short upstream/main)"; then
+            echo "::notice::Merge successful"
+            echo "merge_status=success" >> $GITHUB_OUTPUT
           else
-            echo "::error::Rebase conflict detected. Manual resolution required."
-            echo "rebase_status=conflict" >> $GITHUB_OUTPUT
+            echo "::error::Merge conflict detected. Manual resolution required."
+            echo "merge_status=conflict" >> $GITHUB_OUTPUT
 
             # Get conflict details
             CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ', ' | sed 's/,$//')
             echo "conflicts=$CONFLICTS" >> $GITHUB_OUTPUT
 
-            # Abort the rebase
-            git rebase --abort
+            # Abort the merge
+            git merge --abort
             exit 1
           fi
 
           echo "::endgroup::"
 
-      - name: Push rebased main
-        if: steps.check_sync.outputs.already_synced != 'true' && steps.rebase.outputs.rebase_status == 'success'
+      - name: Push merged main
+        if: steps.check_sync.outputs.already_synced != 'true' && steps.merge.outputs.merge_status == 'success'
         run: |
-          echo "::group::Pushing rebased main to fork"
-          git push origin main --force-with-lease
-          echo "::notice::Successfully pushed rebased main"
+          echo "::group::Pushing merged main to fork"
+          git push origin main
+          echo "::notice::Successfully pushed merged main"
           echo "::endgroup::"
 
       - name: Sync upstream tags
@@ -127,7 +129,7 @@ jobs:
           echo "::endgroup::"
 
       - name: Create conflict issue
-        if: failure() && steps.rebase.outputs.rebase_status == 'conflict'
+        if: failure() && steps.merge.outputs.merge_status == 'conflict'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -135,7 +137,7 @@ jobs:
             const conflicts = '${{ steps.rebase.outputs.conflicts }}';
             const issueBody = `## Upstream Sync Conflict Detected
 
-            The automated upstream sync workflow encountered merge conflicts while rebasing \`main\` onto \`openclaw/openclaw:main\`.
+            The automated upstream sync workflow encountered merge conflicts while merging \`openclaw/openclaw:main\` into fork.
 
             ### Conflicting Files
 
@@ -152,24 +154,27 @@ jobs:
                git reset --hard origin/main
                \`\`\`
 
-            2. Add upstream and rebase:
+            2. Add upstream and merge:
                \`\`\`bash
                git remote add upstream https://github.com/openclaw/openclaw.git
                git fetch upstream
-               git rebase upstream/main
+               git merge upstream/main
                \`\`\`
 
             3. Resolve conflicts in the files listed above
+               - For \`.gitignore\`: Keep both sets of entries
+               - For \`src/agents/sandbox/docker.ts\`: Keep fork version (better error handling)
+               - For \`src/plugins/loader.ts\`: Keep fork version (enhanced with resolveExtensionEntryPoint)
 
-            4. Continue the rebase:
+            4. Complete the merge:
                \`\`\`bash
                git add .
-               git rebase --continue
+               git commit -m "Merge upstream changes"
                \`\`\`
 
-            5. Force push to fork:
+            5. Push to fork:
                \`\`\`bash
-               git push origin main --force-with-lease
+               git push origin main
                \`\`\`
 
             ### Workflow Run
@@ -197,10 +202,10 @@ jobs:
 
           if [ "${{ steps.check_sync.outputs.already_synced }}" = "true" ]; then
             echo "✅ Already up to date with upstream" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ steps.rebase.outputs.rebase_status }}" = "success" ]; then
-            echo "✅ Successfully rebased and pushed to fork" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ steps.rebase.outputs.rebase_status }}" = "conflict" ]; then
-            echo "❌ Rebase conflicts detected" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.merge.outputs.merge_status }}" = "success" ]; then
+            echo "✅ Successfully merged and pushed to fork" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.merge.outputs.merge_status }}" = "conflict" ]; then
+            echo "❌ Merge conflicts detected" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Conflicting files:** ${{ steps.rebase.outputs.conflicts }}" >> $GITHUB_STEP_SUMMARY
           fi
