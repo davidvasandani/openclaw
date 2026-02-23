@@ -71,6 +71,20 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      - name: Check if upstream release exists
+        id: upstream_check
+        run: |
+          # Check if this tag exists in upstream openclaw/openclaw
+          UPSTREAM_RELEASE_URL="https://github.com/openclaw/openclaw/releases/tag/${{ github.ref_name }}"
+          if curl --output /dev/null --silent --head --fail "$UPSTREAM_RELEASE_URL"; then
+            echo "upstream_exists=true" >> $GITHUB_OUTPUT
+            echo "upstream_url=$UPSTREAM_RELEASE_URL" >> $GITHUB_OUTPUT
+            echo "::notice::Upstream release found: $UPSTREAM_RELEASE_URL"
+          else
+            echo "upstream_exists=false" >> $GITHUB_OUTPUT
+            echo "::notice::No upstream release found for ${{ github.ref_name }}"
+          fi
+
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
         uses: softprops/action-gh-release@v2
@@ -83,9 +97,19 @@ jobs:
           body: |
             ## OpenClaw Fork Build
 
+            ${{ steps.upstream_check.outputs.upstream_exists == 'true' && format('**Based on upstream:** [openclaw/openclaw {0}]({1})', github.ref_name, steps.upstream_check.outputs.upstream_url) || '**Fork-specific release**' }}
+
             **Commit:** ${{ github.sha }}
             **Short SHA:** ${{ steps.commit.outputs.short_sha }}
             **Version:** ${{ steps.version.outputs.version }}
+
+            ### Fork Optimizations
+
+            This fork includes the following enhancements over upstream:
+            - 📦 **Package size:** 5.6 MB (90% reduction from ~50MB)
+            - ⚡ **Optimized extensions:** Excluded test files and documentation
+            - 🤖 **Automated releases:** GitHub Actions workflow for consistent builds
+            - 🔄 **Daily upstream sync:** Automatically syncs with openclaw/openclaw
 
             ### Installation
 
@@ -107,6 +131,9 @@ jobs:
             ### Changes
 
             See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/CHANGELOG.md) for details.
+            ${{ steps.upstream_check.outputs.upstream_exists == 'true' && format('
+
+            For upstream changes, see the [upstream release notes]({0}).', steps.upstream_check.outputs.upstream_url) || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
